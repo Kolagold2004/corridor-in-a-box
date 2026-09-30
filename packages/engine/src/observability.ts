@@ -44,6 +44,8 @@ export interface AuditEntry extends LogFields {
   readonly quoteFee?: Money;
   /** Stellar network fee charged for the settlement, in stroops (Horizon `fee_charged`). */
   readonly networkFee?: string;
+  readonly amountRefunded?: string;
+  readonly amountFee?: string;
 }
 
 export interface AuditSink {

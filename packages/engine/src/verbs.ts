@@ -258,6 +258,77 @@ export async function reconcileUntil(
   }
 }
 
+export interface RefundPollOptions {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  /** Absolute epoch-ms after which the anchor refund wait is held. */
+  deadlineMs: number;
+  pollMs: number;
+  corridorId?: string;
+  logger?: Logger;
+  metrics?: Metrics;
+}
+
+/**
+ * Watch the receiving anchor's transaction record for the refund it owns.
+ * SEP-31 reports refunds asynchronously on the transaction; the sending side
+ * must not attempt a second, unilateral reversal while that report is pending.
+ */
+export async function watchRefund(
+  adapter: AnchorAdapter,
+  transactionId: string,
+  opts: RefundPollOptions,
+): Promise<Outcome<TransactionStatus>> {
+  let poll = 0;
+  const startedAt = opts.now();
+  for (;;) {
+    poll += 1;
+    const result = await adapter.getTransaction(transactionId);
+    const status = result.ok ? result.value.status : "error";
+    const elapsedMs = opts.now() - startedAt;
+    opts.logger?.log("debug", "corridor.refund.poll", {
+      transactionId,
+      status,
+      poll,
+      elapsedMs,
+    });
+    opts.metrics?.increment("corridor.refund.poll", {
+      ...(opts.corridorId ? { corridor: opts.corridorId } : {}),
+      status,
+    });
+
+    // SEP-31 reports the refund on the transaction record: either as a
+    // `refunded` status or alongside a terminal failure (`error`/`expired`).
+    if (
+      result.ok &&
+      result.value.refunds &&
+      (result.value.status === "refunded" || result.value.terminalFailure === true)
+    ) {
+      const refund = result.value.refunds;
+      if (refund.completeness === "full") return result;
+      return fail("RECONCILE_MISMATCH", refundMessage(transactionId, refund), {
+        retryable: false,
+        cause: result.value,
+      });
+    }
+    if (opts.now() >= opts.deadlineMs) {
+      return fail(
+        "SETTLEMENT_TIMEOUT",
+        `refund for tx ${transactionId} was not fully reported before timeout (polls=${poll}, elapsed=${elapsedMs}ms)`,
+        { retryable: false, cause: result.ok ? result.value : result.error },
+      );
+    }
+    await opts.sleep(opts.pollMs);
+  }
+}
+
+function refundMessage(
+  transactionId: string,
+  refund: NonNullable<TransactionStatus["refunds"]>,
+): string {
+  return `refund for tx ${transactionId} is ${refund.completeness}: amountRefunded=${refund.amountRefunded.amount} ${refund.amountRefunded.asset}, amountFee=${refund.amountFee.amount} ${refund.amountFee.asset}`;
+}
+
 /**
  * The anchor's terminal `TransactionStatus`, when `reconcileUntil` failed because
  * the anchor reported a terminal non-success state (carried on the error's

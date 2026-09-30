@@ -32,11 +32,13 @@ export {
   settleQuoteProblem,
   reconcile,
   reconcileUntil,
+  watchRefund,
   anchorTerminalStatus,
   backoffMs,
   recover,
   type RecoveryAction,
   type PollOptions,
+  type RefundPollOptions,
 } from "./verbs";
 export {
   consoleLogger,

@@ -161,6 +161,8 @@ export const ReconcileSchema = z.object({
 export const RecoverySchema = z.object({
   max_retries: z.number().int().nonnegative().default(3),
   timeout_seconds: z.number().int().positive().default(900),
+  /** How long to wait for an anchor-driven refund report after a terminal failure. */
+  refund_wait_seconds: z.number().int().positive().default(86_400),
   rollback: z.enum(["refund_sender", "hold", "manual"]).default("refund_sender"),
   reconcile: ReconcileSchema.optional(),
 });

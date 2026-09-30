@@ -40,8 +40,10 @@ import {
   recover,
   reconcileUntil,
   settle,
+  watchRefund,
   settleQuoteProblem,
 } from "./verbs";
+import type { TransactionStatus } from "@corridor/adapter-kit";
 import {
   noopMetrics,
   silentLogger,
@@ -213,7 +215,12 @@ export async function execute(
 
   const advance = async (
     to: CorridorState,
-    meta?: { quoteFee?: Money; networkFee?: string },
+    meta?: {
+      quoteFee?: Money;
+      networkFee?: string;
+      amountRefunded?: string;
+      amountFee?: string;
+    },
   ): Promise<Outcome<void>> => {
     if (!canTransition(run.state, to)) {
       return fail("SETTLEMENT_FAILED", `illegal transition ${run.state} -> ${to}`);
@@ -301,13 +308,34 @@ export async function execute(
     if (!back.ok) return die(back.error);
     // Money moved and the anchor itself reports a terminal failure: it is
     // already refunding (SEP-31 `refunds`), so we wait for its report instead of
-    // asking the chain to reverse a payment it cannot reverse. Watching the
-    // anchor from here is a separate step; this only parks the run correctly.
+    // asking the chain to reverse a payment it cannot reverse.
     if (run.stellarTxHash && anchorTerminalStatus(e)) {
       run.lastError = `${e.code}: ${e.message}`;
       const pending = await advance("refund_pending");
       if (!pending.ok) return die(pending.error);
-      return { ok: false, error: e };
+      const watched = await watchRefund(adapter, opened.value.transactionId, {
+        now,
+        sleep,
+        deadlineMs: now() + corridor.recovery.refund_wait_seconds * 1000,
+        pollMs,
+        corridorId: corridor.id,
+        logger: deps.logger,
+        metrics: deps.metrics,
+      });
+      if (watched.ok) {
+        const info = watched.value.refunds;
+        if (info && !hasRequestedRefund(run)) {
+          const firstPayment = info.payments[0];
+          if (firstPayment?.id) run.refundId = firstPayment.id;
+        }
+        const done = await advance("refunded", refundAudit(info));
+        if (!done.ok) return die(done.error);
+        return { ok: false, error: e };
+      }
+      // The run is held with the watch outcome in `lastError`; the caller still
+      // sees the anchor's own terminal failure that started the recovery.
+      const stopped = await holdAndStop(watched.error, statusFrom(watched.error.cause));
+      return stopped.error === watched.error ? { ok: false, error: e } : stopped;
     }
     // Only reverse the chain if a payment actually went out. If settlement never
     // succeeded, there is nothing on-chain to undo — the sending anchor returns
@@ -342,13 +370,15 @@ export async function execute(
     return { ok: false, error: e };
   };
 
-  const holdAndStop = async (e: CorridorError): Promise<Err> => {
-    if (run.state !== "recovering") {
+  const holdAndStop = async (e: CorridorError, status?: TransactionStatus): Promise<Err> => {
+    // `refund_pending` inherits `recovering`'s exits (state.ts), so it can be
+    // held directly; anything else steps back into `recovering` first.
+    if (run.state !== "recovering" && run.state !== "refund_pending") {
       const back = await advance("recovering");
       if (!back.ok) return die(back.error);
     }
     run.lastError = `${e.code}: ${e.message}`;
-    const held = await advance("held");
+    const held = await advance("held", refundAudit(status?.refunds));
     if (!held.ok) return die(held.error);
     return { ok: false, error: e };
   };
@@ -525,6 +555,29 @@ function toResult(run: StoredRun, trail: readonly CorridorState[]): RunResult {
   };
 }
 
+function isTransactionStatus(value: unknown): value is TransactionStatus {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { status?: unknown }).status === "string" &&
+    typeof (value as { settled?: unknown }).settled === "boolean"
+  );
+}
+
+function statusFrom(value: unknown): TransactionStatus | undefined {
+  return isTransactionStatus(value) ? value : undefined;
+}
+
+function refundAudit(
+  info: TransactionStatus["refunds"],
+): { amountRefunded?: string; amountFee?: string } | undefined {
+  if (!info) return undefined;
+  return {
+    amountRefunded: info.amountRefunded.amount,
+    amountFee: info.amountFee.amount,
+  };
+}
+
 /** Log + audit a single transition. `run` must already be at its new state. */
 async function emitTransition(
   deps: EngineDeps,
@@ -533,7 +586,12 @@ async function emitTransition(
   at: number,
   error?: string,
   routeTrust?: "attested" | "manifest",
-  meta?: { quoteFee?: Money; networkFee?: string },
+  meta?: {
+    quoteFee?: Money;
+    networkFee?: string;
+    amountRefunded?: string;
+    amountFee?: string;
+  },
 ): Promise<void> {
   const entry: AuditEntry = {
     idempotencyKey: run.idempotencyKey,
@@ -546,6 +604,8 @@ async function emitTransition(
     ...(routeTrust && { routeTrust }),
     ...(meta?.quoteFee && { quoteFee: meta.quoteFee }),
     ...(meta?.networkFee && { networkFee: meta.networkFee }),
+    ...(meta?.amountRefunded !== undefined && { amountRefunded: meta.amountRefunded }),
+    ...(meta?.amountFee !== undefined && { amountFee: meta.amountFee }),
   };
   (deps.logger ?? silentLogger).log(error ? "error" : "info", "corridor.transition", entry);
   const metrics = deps.metrics ?? noopMetrics;
