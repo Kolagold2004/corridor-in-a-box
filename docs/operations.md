@@ -37,14 +37,54 @@ run is automated by `pnpm verify:corridor` and the `reference-corridor` workflow
    ANCHOR_SEP31_WEB_AUTH=… CORRIDOR_SIGNER_SECRET=S… \
    pnpm exec vitest run tests/integration/sep31-live.test.ts
    ```
-4. **Run the canary**: `corridor canary corridors/reference.corridor.yaml`.
-   The canary performs the read-only pre-flight and the smallest configured
-   testnet payment, then prints the state trail and transaction hash. Do not
-   substitute an ad-hoc `curl` sequence: the canary is the checked-in proving
-   path and its exit status is the release gate.
-5. Capture the canary's `created → … → completed` trail and `stellarTxHash`, and
-   paste them into the README. A non-zero canary must be investigated before
-   allowing a real payment on the lane.
+4. **Pre-flight the manifest** offline:
+
+   ```bash
+   pnpm cli plan corridors/reference.corridor.yaml
+   ```
+
+   Expected output (abridged):
+
+   ```
+   liveness: ? UNVERIFIED — endpoints present but unconfirmed. NOT runnable.
+
+   liveness warnings:
+     ! dest endpoints are UNVERIFIED — the URLs below have never been confirmed against …
+   ```
+
+   `UNVERIFIED` is the correct and expected result for the reference corridor.
+   `corridors/reference.corridor.yaml` points at `localhost` and deliberately has no
+   `endpoints_verified_at` — setting that field on a localhost manifest would be
+   meaningless. The warning about unconfirmed endpoints is the proof that the
+   manifest is honest, not broken.
+
+   What the pre-flight check is actually verifying here:
+
+   - The manifest parses and validates (exit 0).
+   - The liveness state is **not** `NOT RUNNABLE` — every required endpoint field
+     (`transfer_server_sep31`, `quote_server`, `kyc_server`) is present. A
+     `NOT RUNNABLE` result or a "quotes will fail / no per-customer KYC" warning
+     means the manifest has a structural gap that will break the run.
+   - The output is **not** `✓ VERIFIED` — a localhost manifest that somehow
+     reported verified would be the lie to catch.
+
+   The live readiness check — are the containers up, is SEP-31 receiving, is the
+   observer cursor in range — is `scripts/reference-anchor.sh doctor` (step 2 above,
+   or run it again here):
+
+   ```bash
+   scripts/reference-anchor.sh doctor
+   ```
+
+   That command exits non-zero and names the failing check, so it can gate CI.
+   Run it after `up` and before driving a payment; `plan` cannot replace it for a
+   self-hosted stack.
+
+5. **Drive one payment** with the real implementations wired per the README's
+   "Going live" list (`Sep31Adapter` + `StellarSettlementSubmitter` +
+   `PostgresIdempotencyStore`, with an `audit` sink). Capture the resulting
+   `trail` (the `created → … → completed` line) and the `stellarTxHash`, and paste
+   them into the README.
 
 When that trail is in the README, check off the last Phase-1 box in the ROADMAP.
 
@@ -67,7 +107,9 @@ scripts/reference-anchor.sh down           # tear it all down
 
 A corridor run against a sick stack does not fail fast. It reaches `settled`,
 polls for the whole of `recovery.timeout_seconds` (900s by default) and then
-fails with `SETTLEMENT_TIMEOUT`. Every one of those minutes was spent learning
+fails with `SETTLEMENT_TIMEOUT`. (A corridor can tune its own patience with
+`recovery.reconcile: { poll_seconds, stall_polls }`; unset fields fall back to
+`EngineDeps.reconcilePollMs` / `stallThreshold`, then 2s / 10 polls.) Every one of those minutes was spent learning
 something that was knowable beforehand. Run `doctor` first:
 
 ```
@@ -142,7 +184,7 @@ exits non-zero unless the terminal state is `completed`. It prints the trail on
 both paths — the failing run is the one worth reading:
 
 ```
-trail: created -> quoted -> compliant -> opened -> settling -> retrying -> settling -> recovering -> refunded
+trail: created -> quoted -> compliant -> opened -> verifying -> settling -> retrying -> verifying -> settling -> recovering -> refunded
 
 ✗ SETTLEMENT_FAILED — settlement submit failed: tx_failed operations=[op_src_no_trust]
   terminal state: refunded
@@ -244,11 +286,11 @@ the chain. Verify the belief before closing the run:
   payments (the same check "Crash mid-flight" below prescribes for `settling`)
   before declaring the sender whole.
 
-If an anchor-driven refund path ever lands (a refund-wait state between
-`recovering` and `refunded`), a second, legitimate way into this state appears —
-one where a payment **did** go out and the anchor returned it, hash set. The
-run's trail tells the two apart — and `refund_id`, described below, records
-which refund it was.
+The state machine defines `refund_pending` (between `recovering` and `refunded`)
+but no transition enters it yet — the engine does not call `requestRefund`. When
+a producer lands, a payment that did go out and was returned by the anchor will
+enter `refund_pending` with `stellar_tx_hash` set. The run's trail tells the
+two apart — and `refund_id`, described below, records which refund it was.
 
 ### `refund_id` on the run
 
@@ -273,11 +315,20 @@ No payment went out (failure was at quote/comply/open). Safe to retry with a
 **new** `idempotencyKey`.
 
 When the failure carries a `PRESETTLE_*` code, the pre-settle gate refused the
-attempt before the native payment operation was submitted. The current code is
-`PRESETTLE_INSUFFICIENT_FUNDS`: fund the distribution account, establish the
-bridge-asset trustline, or lower the amount so the amount, fee, and reserve fit;
+attempt before the native payment operation was submitted. Resolve the cause,
 then retry with a new key. Never bypass a failed gate by calling the submitter
 directly.
+
+| Code                              | Meaning                                                             | Operator action                                                                  |
+| --------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `PRESETTLE_ANCHOR_DRIFT`          | Live `/info` or `stellar.toml` no longer matches what was verified. | Re-verify the anchor and update the manifest before retrying.                    |
+| `PRESETTLE_TX_MISMATCH`           | The opened anchor transaction is not what is about to be paid.      | Do not pay; open a new transaction and investigate the anchor response.          |
+| `PRESETTLE_DESTINATION_UNSAFE`    | Destination missing, has no trustline, or is not authorized.        | Confirm the destination account and its trustline/authorization with the anchor. |
+| `PRESETTLE_INSUFFICIENT_FUNDS`    | Amount, fee, and reserve do not fit the distribution account.       | Fund the account, establish the bridge-asset trustline, or lower the amount.     |
+| `PRESETTLE_QUOTE_WINDOW`          | The firm quote will not survive settle + confirm.                   | Request a fresh quote and retry promptly.                                        |
+| `PRESETTLE_AMOUNT_OUT_OF_RANGE`   | Amount is outside the anchor or manifest min/max.                   | Adjust the amount to the advertised limits.                                      |
+| `PRESETTLE_RECEIVER_NOT_ACCEPTED` | The receiver's SEP-12 status is no longer `ACCEPTED`.               | Complete or refresh the receiver's KYC before retrying.                          |
+| `CORRIDOR_UNPROVEN`               | Amount is above the canary cap on a lane that is not yet `PROVEN`.  | Stay within the canary cap until the lane is proven.                             |
 
 ### `refund_pending`
 
