@@ -67,7 +67,7 @@ packages/
                  anchor (SEP-10 auth + SEP-12 KYC; crypto behind an injected signer)
   stellar/       the only package on the money path that touches the chain;
                  @stellar/stellar-sdk-backed settlement submitter + SEP-10 signer
-  router/        RouteResolver seam — open interface + dumb static default
+  router/        RouteResolver seam — open interface + two resolvers (Static + Registry)
   engine/        corridor-agnostic orchestration of the five verbs, with a
                  persisted state machine, crash-resume, recovery, audit trail,
                  metrics hooks, and a durable Postgres idempotency store
@@ -92,10 +92,12 @@ Three boundaries do the work:
    Standards-compliant anchors share one adapter; bespoke exchange/OTC desks
    implement the same interface. Proprietary implementations could be maintained
    separately; none is included in this repo.
-3. **router seam** — the open repo ships the `RouteResolver` interface plus a
-   trivial "use the declared anchor" default. A health-/rate-weighted resolver
-   could be supplied separately; it is not included or injected by this repo.
-   The interface is the seam for that possible future component.
+3. **router seam** — the open repo ships the `RouteResolver` interface plus two
+   resolvers: `StaticRouteResolver` (trust the manifest) and
+   `RegistryRouteResolver` (require a fresh on-chain attestation). A
+   health-/rate-weighted resolver could be supplied separately; it is not
+   included or injected by this repo. The interface is the seam for that
+   possible future component.
 
 ## Corridor sequencing
 
@@ -121,6 +123,8 @@ liveness: ✗ NOT RUNNABLE — a required endpoint is missing.
 
 liveness warnings:
   ! dest has no SEP-31 transfer server — corridor cannot settle. NOT runnable.
+  ! fx.quote_source=sep38 but dest exposes no SEP-38 quote server — quotes will fail.
+  ! dest has no SEP-12 KYC server — assuming 1:1 delivery with no per-customer KYC.
 ```
 
 That warning _is_ the off-ramp scarcity, surfaced at build time instead of in
@@ -234,6 +238,15 @@ the anchor's back-office plumbing, not the engine — but it means **the
 `reconcile → completed` leg is still unproven against a real counterparty**, and
 the engine's timeout/recovery path is what actually ran. Closing that is the
 remaining Phase-1 item.
+
+**Update (2026-09-01): cursor seeding fixed in #65.** `reference-anchor.sh up`
+now reseeds the observer cursor from Horizon's tip on every start (see [the
+observer cursor](./docs/operations.md#the-observer-cursor)), #66 added a
+cursor-lag check to `doctor`, and #67/#75 added `pnpm verify:corridor` plus the
+scheduled [`reference-corridor`](https://github.com/ezedike-evan/corridor-in-a-box/actions/workflows/reference-corridor.yml)
+workflow, which runs the whole corridor against the reference stack. The stale
+cursor is no longer the known blocker. `reconcile → completed` stays **unproven**
+until that workflow passes; it currently fails.
 
 ## Proof the settle leg is real
 
