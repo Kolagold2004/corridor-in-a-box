@@ -6,7 +6,7 @@ describe("operations runbook coverage", () => {
   it("mentions every PRESETTLE_* and CORRIDOR_* error code", () => {
     const types = readFileSync(resolve(process.cwd(), "packages/types/src/index.ts"), "utf8");
     const docs = readFileSync(resolve(process.cwd(), "docs/operations.md"), "utf8");
-    const codes = [...types.matchAll(/\| \"((?:PRESETTLE|CORRIDOR)_[A-Z0-9_]+)\"/g)].map(
+    const codes = [...types.matchAll(/\| "((?:PRESETTLE|CORRIDOR)_[A-Z0-9_]+)"/g)].map(
       (match) => match[1],
     );
     // CORRIDOR_HALTED is supplied by the breaker package when it is enabled;
