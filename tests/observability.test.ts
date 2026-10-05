@@ -14,7 +14,7 @@ import {
 } from "@corridor/engine";
 import type { PaymentIntent } from "@corridor/types";
 
-function corridor(): Corridor {
+function corridor(recovery: Record<string, unknown> = {}): Corridor {
   const r = parseCorridor({
     id: "test",
     source: { name: "S", asset: "USDC", endpoints: { home_domain: "s.example" } },
@@ -30,7 +30,7 @@ function corridor(): Corridor {
     fx: { path: ["ARS", "USDC", "ARS"], who_holds_risk: "receiving_anchor" },
     compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
     settlement: { network: "public", asset_issuer: "GISSUER" },
-    recovery: {},
+    recovery,
     proof: {
       canary_completed_at: "1970-01-01T00:00:00Z",
       stellar_tx_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
@@ -112,11 +112,14 @@ describe("audit trail", () => {
   });
 });
 
+const heldCorridor = () =>
+  corridor({ max_retries: 0, timeout_seconds: 3600, rollback: "hold" });
+
 describe("operational alerts", () => {
   it("raises one alert when a run enters held", async () => {
     const alerting = new InMemoryAlerting();
     const deps: EngineDeps = {
-      resolver: new StaticRouteResolver(() => createMockAdapter({ settled: false }), {
+      resolver: new StaticRouteResolver(() => createMockAdapter({ terminalFailure: true }), {
         trustManifestWithoutAttestation: true,
       }),
       submitter: createMockSubmitter(),
@@ -126,10 +129,11 @@ describe("operational alerts", () => {
       sleep: async () => {},
       reconcilePollMs: 1,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const result = await execute(
       { ...intent, idempotencyKey: "held-alert" },
-      corridor(),
+      heldCorridor(),
       deps,
     );
 
@@ -143,24 +147,55 @@ describe("operational alerts", () => {
     });
   });
 
-  it("keeps the run outcome when the alert sink throws", async () => {
-    const logs: { level: string; msg: string }[] = [];
+  it("does not re-alert when a run already held is resumed with the same key", async () => {
+    const alerting = new InMemoryAlerting();
     const deps: EngineDeps = {
-      resolver: new StaticRouteResolver(() => createMockAdapter({ settled: false }), {
+      resolver: new StaticRouteResolver(() => createMockAdapter({ terminalFailure: true }), {
         trustManifestWithoutAttestation: true,
       }),
       submitter: createMockSubmitter(),
       idempotency: new InMemoryIdempotencyStore(),
-      alerting: { raise: () => { throw new Error("webhook unavailable"); } },
+      alerting,
+      now: () => 1000,
+      sleep: async () => {},
+      reconcilePollMs: 1,
+      trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
+    };
+    const held = { ...intent, idempotencyKey: "held-resume" };
+    await execute(held, heldCorridor(), deps);
+    expect(await deps.idempotency?.get("held-resume")).toMatchObject({ state: "held" });
+    expect(alerting.alerts.filter((a) => a.kind === "held")).toHaveLength(1);
+
+    const resumed = await execute(held, heldCorridor(), deps);
+    expect(resumed.ok).toBe(false);
+    expect(alerting.alerts.filter((a) => a.kind === "held")).toHaveLength(1);
+    expect(alerting.alerts).toHaveLength(1);
+  });
+
+  it("keeps the run outcome when the alert sink throws", async () => {
+    const logs: { level: string; msg: string }[] = [];
+    const deps: EngineDeps = {
+      resolver: new StaticRouteResolver(() => createMockAdapter({ terminalFailure: true }), {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: createMockSubmitter(),
+      idempotency: new InMemoryIdempotencyStore(),
+      alerting: {
+        raise: () => {
+          throw new Error("webhook unavailable");
+        },
+      },
       logger: { log: (level, msg) => logs.push({ level, msg }) },
       now: () => 1000,
       sleep: async () => {},
       reconcilePollMs: 1,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const result = await execute(
       { ...intent, idempotencyKey: "held-alert-fails" },
-      corridor(),
+      heldCorridor(),
       deps,
     );
 
